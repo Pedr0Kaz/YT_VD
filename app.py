@@ -753,6 +753,7 @@ class App(tk.Tk):
                 job.outtmpl,
                 job.pause_event,
                 prepared,
+                job.video.live_status,
             )
         except Exception as exc:  # noqa: BLE001 - pausa ou erro mostrado na linha
             result = exc

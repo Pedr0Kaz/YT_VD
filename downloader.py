@@ -52,6 +52,7 @@ class VideoInfo:
     duration: int | None
     resolutions: list[Resolution]
     thumbnail: bytes | None = None
+    live_status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -237,7 +238,11 @@ def _raise_from_ytdlp(exc: YtDlpDownloadError) -> None:
             "O YouTube pediu confirmação de que não és um robô. "
             "Inicia sessão no YouTube no Chrome ou no Edge e volta a analisar."
         )
-    elif "could not copy chrome cookie database" in lowered:
+    elif "live event has ended" in lowered:
+        message = (
+            "Esta emissão ao vivo já acabou e o YouTube ainda não a disponibiliza como vídeo. "
+            "Tenta outra vez dentro de algum tempo."
+        )
         message = (
             "Não consegui ler a sessão do Chrome ou do Edge. "
             "Fecha o browser, ou escolhe o outro, e tenta outra vez."
@@ -306,6 +311,7 @@ def probe(url: str, browser: str | None = None) -> VideoInfo:
         duration=duration,
         resolutions=resolutions,
         thumbnail=_download_thumbnail(info.get("thumbnail"), video_id),
+        live_status=info.get("live_status") if isinstance(info.get("live_status"), str) else None,
     )
 
 
@@ -668,6 +674,7 @@ def download(
     outtmpl: str | None = None,
     pause_event: threading.Event | None = None,
     on_template=None,
+    live_status: str | None = None,
 ) -> SavedDownload:
     final_path: dict[str, str] = {}
     meter = _SpeedMeter()
@@ -715,20 +722,40 @@ def download(
             on_progress("A juntar vídeo e áudio…", None, None)
 
     opts = _base_opts(output_dir, height, [hook], browser, template)
-    # O YouTube entrega um ficheiro só. Sem isto, -N não abre ligações em paralelo.
-    opts["extractor_args"] = {"youtube": {"formats": ["dashy"], "skip": ["hls"]}}
+    # Num vídeo normal o YouTube entrega um ficheiro só. Os fragmentos só aparecem com dashy.
+    # Numa live já terminada, esse modo fica sem formatos e o erro é "live event has ended".
+    if live_status != "post_live":
+        opts["extractor_args"] = {"youtube": {"formats": ["dashy"], "skip": ["hls"]}}
+
+    def _fetch(current: dict):
+        with YoutubeDL(current) as ydl:
+            return ydl.extract_info(url, download=True)
+
     try:
         try:
-            with YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+            info = _fetch(opts)
         except DownloadPaused:
             paused = True
             raise
         except YtDlpDownloadError as exc:
-            recovered = _recover_split(output_dir, template, title, on_progress, url, height)
-            if recovered:
-                return recovered
-            _raise_from_ytdlp(exc)
+            if opts.get("extractor_args") and "live event has ended" in str(exc).lower():
+                opts.pop("extractor_args", None)
+                on_progress("A gravar a emissão que já terminou…", None, None)
+                try:
+                    info = _fetch(opts)
+                except DownloadPaused:
+                    paused = True
+                    raise
+                except YtDlpDownloadError as retry_exc:
+                    recovered = _recover_split(output_dir, template, title, on_progress, url, height)
+                    if recovered:
+                        return recovered
+                    _raise_from_ytdlp(retry_exc)
+            else:
+                recovered = _recover_split(output_dir, template, title, on_progress, url, height)
+                if recovered:
+                    return recovered
+                _raise_from_ytdlp(exc)
         except OSError as exc:
             recovered = _recover_split(output_dir, template, title, on_progress, url, height)
             if recovered:

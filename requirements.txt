@@ -1,0 +1,4 @@
+--pre
+yt-dlp[default]
+imageio-ffmpeg==0.6.0
+pillow==12.2.0

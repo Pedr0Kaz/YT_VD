@@ -1,0 +1,16 @@
+# Builds do PyInstaller e cópias locais dos programas
+aplicacao/
+bin/
+build/
+build-aplicacao/
+dist/
+standalone/
+
+# Vídeos descarregados e restos de testes
+downloads/
+_verify/
+_speedlab/
+
+# Python
+__pycache__/
+*.py[cod]

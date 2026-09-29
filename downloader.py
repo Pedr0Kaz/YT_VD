@@ -34,6 +34,10 @@ class DownloadPaused(Exception):
         self.template = template
 
 
+class MergeStopped(Exception):
+    """A junção foi interrompida porque o programa está a fechar."""
+
+
 @dataclass(frozen=True)
 class Resolution:
     height: int | None
@@ -340,6 +344,15 @@ def hold_output(template: str | None, title: str | None) -> None:
         _reserved_names.add(prepared)
 
 
+def hold_path(path: Path) -> None:
+    with _name_lock:
+        _reserved_names.add(str(path))
+
+
+def release_path(path: Path) -> None:
+    _release_name(str(path))
+
+
 def _output_busy(prepared: str) -> bool:
     path = Path(prepared)
     # Um parcial sem o MP4 final não ocupa o nome: voltar a descarregar continua esse ficheiro.
@@ -443,6 +456,208 @@ def _saved_url(info: dict | None, url: str) -> str:
     return url
 
 
+_SPLIT_FILE = re.compile(r"^(?P<stem>.+)\.f\d+\.(?P<ext>mp4|webm|m4a|mkv|opus|ogg)$", re.IGNORECASE)
+_SPLIT_TITLE = re.compile(r"^(?P<title>.*) \[(?P<height>\d+)p\]$")
+
+
+@dataclass(frozen=True)
+class SplitDownload:
+    """Vídeo e áudio já gravados, à espera de serem unidos num MP4."""
+
+    video: Path
+    audio: Path
+    output: Path
+    title: str
+    resolution: str
+    duration: float | None
+
+
+def _probe_media(path: Path) -> tuple[set[str], float | None]:
+    try:
+        completed = subprocess.run(
+            [ensure_ffmpeg(), "-hide_banner", "-i", str(path)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set(), None
+    text = completed.stderr or ""
+    kinds = set()
+    if re.search(r"Stream #\d+:\d+.*?:\s*Video:", text):
+        kinds.add("video")
+    if re.search(r"Stream #\d+:\d+.*?:\s*Audio:", text):
+        kinds.add("audio")
+    duration = None
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+    if match:
+        duration = int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+    return kinds, duration
+
+
+def find_split_downloads(folder: Path) -> list[SplitDownload]:
+    """Pares de vídeo e áudio que ficaram lado a lado, sem o MP4 final."""
+    if not folder.is_dir():
+        return []
+    groups: dict[str, list[Path]] = {}
+    for path in folder.iterdir():
+        if not path.is_file():
+            continue
+        match = _SPLIT_FILE.match(path.name)
+        if match is None:
+            continue
+        groups.setdefault(match.group("stem"), []).append(path)
+
+    found: list[SplitDownload] = []
+    for stem, paths in groups.items():
+        output = folder / f"{stem}.mp4"
+        if output.is_file() and output.stat().st_size > 1024 * 1024:
+            continue
+        probed = [(path, *_probe_media(path)) for path in paths]
+        videos = [path for path, kinds, _duration in probed if "video" in kinds]
+        audios = [path for path, kinds, _duration in probed if "audio" in kinds and "video" not in kinds]
+        if not videos or not audios:
+            continue
+        video = max(videos, key=lambda item: item.stat().st_size)
+        audio = max(audios, key=lambda item: item.stat().st_size)
+        duration = next((item[2] for item in probed if item[0] == video), None)
+        title_match = _SPLIT_TITLE.match(stem)
+        if title_match:
+            title = title_match.group("title")
+            resolution = f"{title_match.group('height')}p"
+        else:
+            title, resolution = stem, ""
+        found.append(SplitDownload(video, audio, output, title, resolution, duration))
+    return found
+
+
+def merge_streams(video: Path, audio: Path, output: Path, on_progress, cancel: threading.Event | None = None) -> Path:
+    """Copia o vídeo e o áudio para um único MP4, sem voltar a codificar."""
+    ffmpeg = ensure_ffmpeg()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(output.stem + ".merging.mp4")
+    if temporary.exists():
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+
+    need = video.stat().st_size + audio.stat().st_size
+    if shutil.disk_usage(output.parent).free < need + 64 * 1024 * 1024:
+        raise DownloadError(
+            f"Não há espaço livre suficiente em {output.drive} para juntar o vídeo e o áudio."
+        )
+
+    _kinds, duration = _probe_media(video)
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-y",
+        "-i",
+        str(video),
+        "-i",
+        str(audio),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        str(temporary),
+    ]
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    errors: list[str] = []
+
+    def _drain_errors() -> None:
+        if process.stderr is not None:
+            errors.append(process.stderr.read())
+
+    threading.Thread(target=_drain_errors, daemon=True).start()
+    last_emit = 0.0
+    assert process.stdout is not None
+    try:
+        for line in process.stdout:
+            if cancel is not None and cancel.is_set():
+                process.terminate()
+                try:
+                    process.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                temporary.unlink(missing_ok=True)
+                raise MergeStopped()
+            match = re.match(r"out_time=(\d+):(\d+):(\d+(?:\.\d+)?)", line.strip())
+            if match is None or not duration:
+                continue
+            elapsed = int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+            percent = min(99.0, elapsed / duration * 100)
+            now = time.monotonic()
+            if now - last_emit < 0.5:
+                continue
+            last_emit = now
+            message = "A finalizar o ficheiro…" if percent >= 98 else "A juntar vídeo e áudio…"
+            on_progress(message, percent, None)
+        return_code = process.wait()
+    except MergeStopped:
+        raise
+    except Exception:
+        process.kill()
+        temporary.unlink(missing_ok=True)
+        raise
+
+    if return_code != 0 or not temporary.is_file() or temporary.stat().st_size < 1024:
+        temporary.unlink(missing_ok=True)
+        detail = ""
+        if errors:
+            lines = [line.strip() for line in errors[0].splitlines() if line.strip()]
+            if lines:
+                detail = " " + lines[-1]
+        raise DownloadError(f"Não consegui juntar o vídeo e o áudio.{detail}")
+
+    os.replace(temporary, output)
+    for source in (video, audio):
+        try:
+            source.unlink()
+        except OSError:
+            pass
+        sidecar = Path(str(source) + ".ytdl")
+        if sidecar.is_file():
+            try:
+                sidecar.unlink()
+            except OSError:
+                pass
+    on_progress("Download concluído.", 100, None)
+    return output
+
+
+def _recover_split(output_dir: Path, template: str, title: str | None, on_progress, url: str, height: int | None) -> SavedDownload | None:
+    prepared = _prepared_name(template, title)
+    if not prepared:
+        return None
+    target = Path(prepared)
+    for split in find_split_downloads(output_dir):
+        if split.output != target:
+            continue
+        merged = merge_streams(split.video, split.audio, split.output, on_progress)
+        return SavedDownload(path=merged, resolution=split.resolution or (f"{height}p" if height else ""), url=url)
+    return None
+
+
 def download(
     url: str,
     height: int | None,
@@ -510,10 +725,25 @@ def download(
             paused = True
             raise
         except YtDlpDownloadError as exc:
+            recovered = _recover_split(output_dir, template, title, on_progress, url, height)
+            if recovered:
+                return recovered
             _raise_from_ytdlp(exc)
+        except OSError as exc:
+            recovered = _recover_split(output_dir, template, title, on_progress, url, height)
+            if recovered:
+                return recovered
+            if isinstance(exc, FileNotFoundError):
+                raise DownloadError(
+                    "Não consegui juntar o vídeo e o áudio. Falta o ffmpeg ou um dos ficheiros."
+                ) from exc
+            raise
 
         saved = _finished_file(info, final_path.get("path"))
         if saved is None:
+            recovered = _recover_split(output_dir, template, title, on_progress, url, height)
+            if recovered:
+                return recovered
             raise DownloadError("O download terminou, mas o ficheiro final não foi encontrado.")
         on_progress("Download concluído.", 100, None)
         return SavedDownload(

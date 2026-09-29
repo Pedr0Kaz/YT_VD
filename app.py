@@ -16,11 +16,17 @@ from PIL import Image, ImageTk
 from downloader import (
     DownloadError,
     DownloadPaused,
+    MergeStopped,
     Resolution,
     SavedDownload,
+    SplitDownload,
     VideoInfo,
     discard_partials,
+    find_split_downloads,
     hold_output,
+    hold_path,
+    merge_streams,
+    release_path,
     _download_thumbnail,
     available_browsers,
     download,
@@ -85,6 +91,7 @@ class _ActiveJob:
         self.action: tk.Button | None = None
         self.remove_button: tk.Button | None = None
         self.photo: ImageTk.PhotoImage | None = None
+        self.split: SplitDownload | None = None
 
 
 class App(tk.Tk):
@@ -106,6 +113,8 @@ class App(tk.Tk):
         self._next_job = 1
         self._closing = False
         self._last_active_save = 0.0
+        self._merging = 0
+        self._pending_merges: list[SplitDownload] = []
 
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -114,6 +123,7 @@ class App(tk.Tk):
         self._refresh_history()
         self._restore_active()
         threading.Thread(target=self._import_previous_download, daemon=True).start()
+        threading.Thread(target=self._scan_splits, args=(self.output_var.get().strip(),), daemon=True).start()
 
     def _build(self) -> None:
         style = ttk.Style(self)
@@ -778,6 +788,12 @@ class App(tk.Tk):
         if job.action is None:
             return
         job.action.configure(state="normal")
+        if job.state == "merging":
+            job.action.pack_forget()
+            if job.remove_button is not None:
+                job.remove_button.pack_forget()
+            return
+        job.action.pack(side="left")
         if job.state == "paused":
             job.action.configure(text="Continuar", command=lambda jid=job.job_id: self._resume_job(jid))
             if job.remove_button is not None:
@@ -805,7 +821,7 @@ class App(tk.Tk):
 
     def _pause_job(self, job_id: int) -> None:
         job = self._jobs.get(job_id)
-        if job is None or job.state in ("paused", "error", "pausing"):
+        if job is None or job.state in ("paused", "error", "pausing", "merging"):
             return
         if job.state == "queued":
             self._queue = [item for item in self._queue if item.job_id != job_id]
@@ -859,7 +875,9 @@ class App(tk.Tk):
 
     def _save_active(self) -> None:
         self._last_active_save = time.monotonic()
-        save_active_jobs([self._record_job(job) for job in self._jobs.values() if job.state != "error"])
+        save_active_jobs(
+            [self._record_job(job) for job in self._jobs.values() if job.state not in ("error", "merging")]
+        )
 
     def _restore_active(self) -> None:
         items = load_active_jobs()
@@ -909,6 +927,102 @@ class App(tk.Tk):
             self._next_job = max(self._jobs) + 1
             self.status_var.set("Há downloads em pausa. Carrega em Continuar.")
 
+    def _scan_splits(self, folder: str) -> None:
+        try:
+            found = find_split_downloads(Path(folder))
+        except Exception as exc:  # noqa: BLE001 - mostrado na linha de estado
+            self.after(0, lambda: self.status_var.set(f"Não consegui procurar ficheiros por juntar: {exc}"))
+            return
+        self.after(0, lambda items=found: self._queue_merges(items))
+
+    def _queue_merges(self, items: list[SplitDownload]) -> None:
+        if self._closing or not items:
+            return
+        self._pending_merges.extend(items)
+        self.status_var.set("Encontrei vídeo e áudio separados. Vou juntá-los.")
+        self._start_next_merge()
+
+    def _start_next_merge(self) -> None:
+        if self._closing or self._merging or not self._pending_merges:
+            return
+        split = self._pending_merges.pop(0)
+        hold_path(split.output)
+        video = VideoInfo("", split.title, "", None, [], None)
+        job = _ActiveJob(
+            self._next_job,
+            video,
+            "",
+            None,
+            str(split.output.parent),
+            None,
+            split.resolution or "—",
+        )
+        self._next_job += 1
+        job.state = "merging"
+        job.split = split
+        self._jobs[job.job_id] = job
+        self._merging += 1
+        self._mount_job(job)
+        self._paint_job(job.job_id, "A juntar vídeo e áudio…", 0, None)
+        threading.Thread(target=self._run_merge, args=(job,), daemon=True).start()
+
+    def _run_merge(self, job: _ActiveJob) -> None:
+        split = job.split
+        assert split is not None
+
+        def report(message: str, percent: float | None, rate: str | None = None) -> None:
+            self.after(0, lambda m=message, p=percent, s=rate: self._paint_job(job.job_id, m, p, s))
+
+        try:
+            result: Path | BaseException | None = merge_streams(
+                split.video, split.audio, split.output, report, job.pause_event
+            )
+        except MergeStopped:
+            result = None
+        except Exception as exc:  # noqa: BLE001 - mostrado na linha da junção
+            result = exc
+        finally:
+            release_path(split.output)
+        self.after(0, lambda finished=result: self._merge_finished(job.job_id, finished))
+
+    def _merge_finished(self, job_id: int, result: Path | BaseException | None) -> None:
+        self._merging = max(0, self._merging - 1)
+        job = self._jobs.get(job_id)
+        if result is None or self._closing:
+            if job is not None and job.row is not None:
+                self._dismiss_job(job_id)
+            self._start_next_merge()
+            return
+        if isinstance(result, BaseException):
+            text = str(result) if isinstance(result, DownloadError) else f"Falhou: {result}"
+            if job is not None and job.detail is not None and job.progress is not None and job.percent is not None:
+                job.state = "error"
+                job.progress.stop()
+                job.progress.configure(mode="determinate")
+                job.progress["value"] = 0
+                job.percent.configure(text="!")
+                job.detail.configure(text=text, fg=ACCENT)
+                self._sync_action(job)
+            if self.winfo_exists():
+                self.status_var.set(text)
+                if not self._closing:
+                    messagebox.showerror("Não foi possível juntar", text)
+            self._start_next_merge()
+            return
+        if job is not None and job.split is not None:
+            record_download(
+                title=job.split.title,
+                path=result,
+                video_id="",
+                thumbnail=None,
+                resolution=job.split.resolution,
+                url="",
+            )
+            self._refresh_history()
+            self.status_var.set(f"Guardado em {result}")
+            self._dismiss_job(job_id)
+        self._start_next_merge()
+
     def _on_close(self) -> None:
         if self._closing:
             return
@@ -918,14 +1032,16 @@ class App(tk.Tk):
             if job.state == "running":
                 job.state = "pausing"
                 job.pause_event.set()
+            elif job.state == "merging":
+                job.pause_event.set()
             elif job.state == "queued":
                 job.state = "paused"
         deadline = time.monotonic() + 8
-        while self._running and time.monotonic() < deadline:
+        while (self._running or self._merging) and time.monotonic() < deadline:
             self.update()
             time.sleep(0.05)
         for job in self._jobs.values():
-            if job.state != "error":
+            if job.state not in ("error", "merging"):
                 job.state = "paused"
         self._save_active()
         self.destroy()

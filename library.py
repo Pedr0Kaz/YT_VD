@@ -25,6 +25,10 @@ def _history_path() -> Path:
     return data_dir() / "history.json"
 
 
+def _active_path() -> Path:
+    return data_dir() / "active.json"
+
+
 def _read_json(path: Path, fallback):
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -67,6 +71,21 @@ def save_browser(browser: str) -> None:
         settings = {}
     settings["browser"] = browser
     _write_json(_settings_path(), settings)
+
+
+def load_active_jobs() -> list[dict]:
+    items = _read_json(_active_path(), [])
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def save_active_jobs(items: list[dict]) -> None:
+    _write_json(_active_path(), items)
+
+
+def store_thumbnail(key: str, data: bytes | None) -> str | None:
+    return _store_thumbnail(key, data)
 
 
 def load_history() -> list[dict]:

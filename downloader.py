@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -23,6 +24,14 @@ from yt_dlp.utils import DownloadError as YtDlpDownloadError
 
 class DownloadError(Exception):
     """Erro mostrado ao utilizador, já em texto simples."""
+
+
+class DownloadPaused(Exception):
+    """O utilizador pausou. O ficheiro parcial fica no disco para continuar."""
+
+    def __init__(self, template: str) -> None:
+        super().__init__("Em pausa")
+        self.template = template
 
 
 @dataclass(frozen=True)
@@ -202,7 +211,8 @@ def _base_opts(
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
-        "concurrent_fragment_downloads": 48,
+        "concurrent_fragment_downloads": 8,
+        "continuedl": True,
         "buffersize": 1024 * 1024,
         "retries": 10,
         "fragment_retries": 10,
@@ -295,10 +305,71 @@ def probe(url: str, browser: str | None = None) -> VideoInfo:
     )
 
 
-def _unique_template(output_dir: Path, height: int | None, title: str | None) -> str:
+_name_lock = threading.Lock()
+_reserved_names: set[str] = set()
+
+
+def _release_name(reserved: str | None) -> None:
+    if not reserved:
+        return
+    with _name_lock:
+        _reserved_names.discard(reserved)
+
+
+def _prepared_name(template: str, title: str | None) -> str | None:
+    if not title:
+        return None
+    ydl = YoutubeDL(
+        {
+            "windowsfilenames": True,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "outtmpl": template,
+        }
+    )
+    return str(Path(ydl.prepare_filename({"title": title, "ext": "mp4"})))
+
+
+def hold_output(template: str | None, title: str | None) -> None:
+    """Reserva o nome de um download em pausa para ninguém o usar ao mesmo tempo."""
+    prepared = _prepared_name(template, title) if template else None
+    if not prepared:
+        return
+    with _name_lock:
+        _reserved_names.add(prepared)
+
+
+def _output_busy(prepared: str) -> bool:
+    path = Path(prepared)
+    # Um parcial sem o MP4 final não ocupa o nome: voltar a descarregar continua esse ficheiro.
+    return path.exists() or prepared in _reserved_names
+
+
+def discard_partials(template: str | None, title: str | None) -> None:
+    """Apaga o download a meio quando o utilizador remove a pausa da lista."""
+    prepared = _prepared_name(template, title) if template else None
+    if not prepared:
+        return
+    path = Path(prepared)
+    _release_name(prepared)
+    if not path.parent.is_dir():
+        return
+    prefix = path.stem + "."
+    for child in path.parent.iterdir():
+        if child.name == path.name:
+            continue
+        if child.name.startswith(prefix) and child.name.endswith((".part", ".ytdl")):
+            try:
+                child.unlink()
+            except OSError:
+                pass
+
+
+def _unique_template(output_dir: Path, height: int | None, title: str | None) -> tuple[str, str | None]:
     """Nome com a resolução, e um número extra se esse ficheiro já existir."""
     if not height:
-        return str(output_dir / "%(title)s [%(height)sp].%(ext)s")
+        return str(output_dir / "%(title)s [%(height)sp].%(ext)s"), None
 
     label = f"{height}p"
     ydl = YoutubeDL(
@@ -311,17 +382,19 @@ def _unique_template(output_dir: Path, height: int | None, title: str | None) ->
         }
     )
     if not title:
-        return ydl.params["outtmpl"]["default"]
+        return ydl.params["outtmpl"]["default"], None
 
     template = ydl.params["outtmpl"]["default"]
-    for index in range(1, 100):
-        extra = "" if index == 1 else f" ({index})"
-        template = str(output_dir / f"%(title)s [{label}]{extra}.%(ext)s")
-        ydl.params["outtmpl"]["default"] = template
-        prepared = Path(ydl.prepare_filename({"title": title, "ext": "mp4"}))
-        if not prepared.exists():
-            return template
-    return template
+    with _name_lock:
+        for index in range(1, 100):
+            extra = "" if index == 1 else f" ({index})"
+            template = str(output_dir / f"%(title)s [{label}]{extra}.%(ext)s")
+            ydl.params["outtmpl"]["default"] = template
+            prepared = str(Path(ydl.prepare_filename({"title": title, "ext": "mp4"})))
+            if not _output_busy(prepared):
+                _reserved_names.add(prepared)
+                return template, prepared
+    return template, None
 
 
 def video_file_height(path: Path) -> int | None:
@@ -377,13 +450,30 @@ def download(
     on_progress,
     browser: str | None = None,
     title: str | None = None,
+    outtmpl: str | None = None,
+    pause_event: threading.Event | None = None,
+    on_template=None,
 ) -> SavedDownload:
     final_path: dict[str, str] = {}
     meter = _SpeedMeter()
     last_emit = 0.0
+    paused = False
+    if outtmpl:
+        template = outtmpl
+        reserved = _prepared_name(template, title)
+        if reserved:
+            with _name_lock:
+                _reserved_names.add(reserved)
+    else:
+        template, reserved = _unique_template(output_dir, height, title)
+    if on_template is not None:
+        on_template(template)
 
     def hook(status: dict) -> None:
-        nonlocal last_emit
+        nonlocal last_emit, paused
+        if pause_event is not None and pause_event.is_set():
+            paused = True
+            raise DownloadPaused(template)
         info = status.get("info_dict") or {}
         phase = _stream_phase(info)
         if status.get("status") == "downloading":
@@ -400,31 +490,40 @@ def download(
             eta = status.get("eta")
             if speed and total and downloaded < total:
                 eta = int((total - downloaded) / speed)
-            on_progress(_progress_text(phase, downloaded, total, speed, eta), percent)
+            rate = _format_rate(speed) if speed else None
+            on_progress(_progress_text(phase, downloaded, total, speed, eta), percent, rate)
         elif status.get("status") == "finished":
             path = status.get("filename")
             if path:
                 final_path["path"] = path
             last_emit = 0.0
-            on_progress("A juntar vídeo e áudio…", None)
+            on_progress("A juntar vídeo e áudio…", None, None)
 
-    template = _unique_template(output_dir, height, title)
     opts = _base_opts(output_dir, height, [hook], browser, template)
+    # O YouTube entrega um ficheiro só. Sem isto, -N não abre ligações em paralelo.
+    opts["extractor_args"] = {"youtube": {"formats": ["dashy"], "skip": ["hls"]}}
     try:
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-    except YtDlpDownloadError as exc:
-        _raise_from_ytdlp(exc)
+        try:
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+        except DownloadPaused:
+            paused = True
+            raise
+        except YtDlpDownloadError as exc:
+            _raise_from_ytdlp(exc)
 
-    saved = _finished_file(info, final_path.get("path"))
-    if saved is None:
-        raise DownloadError("O download terminou, mas o ficheiro final não foi encontrado.")
-    on_progress("Download concluído.", 100)
-    return SavedDownload(
-        path=saved,
-        resolution=_saved_resolution(info, height),
-        url=_saved_url(info, url),
-    )
+        saved = _finished_file(info, final_path.get("path"))
+        if saved is None:
+            raise DownloadError("O download terminou, mas o ficheiro final não foi encontrado.")
+        on_progress("Download concluído.", 100, None)
+        return SavedDownload(
+            path=saved,
+            resolution=_saved_resolution(info, height),
+            url=_saved_url(info, url),
+        )
+    finally:
+        if reserved and not paused:
+            _release_name(reserved)
 
 
 def _finished_file(info: dict | None, hook_path: str | None) -> Path | None:

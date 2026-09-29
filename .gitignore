@@ -1,5 +1,8 @@
 # Builds do PyInstaller e cópias locais dos programas
 aplicacao/
+programa/
+rapido/
+pausa/
 bin/
 build/
 build-aplicacao/
